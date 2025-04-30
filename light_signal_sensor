@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 import cv2
 import numpy as np
+import os
+import time
 import rft_hsvrgb as rf
 import imutils
 import rospy
 from std_msgs.msg import String
 
 CALIBRATION_FILE = "multi_color_calibration.npy"
+SYNC_FLAG_FILE = "/tmp/tracker_ready.flag"
+
+def wait_for_tracker_ready():
+    while not os.path.exists(SYNC_FLAG_FILE):
+        print("Waiting for ROS_line_tracker to finish calibration...")
+        time.sleep(1)
 
 def save_calibration_data(color_ranges, color_space='HSV'):
     data = {'color_space': color_space, 'ranges': color_ranges}
     np.save(CALIBRATION_FILE, data)
-    print(f"Calibration data saved in {color_space} space.")
 
 def load_calibration_data():
     try:
@@ -21,17 +28,24 @@ def load_calibration_data():
         return None, None
 
 def process_colors(frame, color_ranges, range_filter='HSV', publisher=None):
-    """Detect multiple colors and optionally publish detections."""
-    if range_filter.upper() == 'HSV':
-        frame_to_thresh = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    else:
-        frame_to_thresh = frame
+    brightness = 50
+    saturation = 50
+    if color_ranges:
+        sample = next(iter(color_ranges.values()))
+        brightness = sample.get("brightness", 50)
+        saturation = sample.get("saturation", 50)
 
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hsv[..., 1] = cv2.multiply(hsv[..., 1], saturation / 50.0)
+    hsv[..., 2] = cv2.multiply(hsv[..., 2], brightness / 50.0)
+    hsv = np.clip(hsv, 0, 255).astype(np.uint8)
+
+    frame_to_thresh = hsv if range_filter.upper() == 'HSV' else frame
     output_frame = frame.copy()
-
     detected_colors = set()
 
-    for color_name, (lower, upper) in color_ranges.items():
+    for color_name, data in color_ranges.items():
+        lower, upper = np.array(data["lower"]), np.array(data["upper"])
         mask = cv2.inRange(frame_to_thresh, lower, upper)
 
         kernel = np.ones((5, 5), np.uint8)
@@ -39,23 +53,17 @@ def process_colors(frame, color_ranges, range_filter='HSV', publisher=None):
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
         for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area > 500:
+            if cv2.contourArea(cnt) > 500:
                 x, y, w, h = cv2.boundingRect(cnt)
                 cv2.rectangle(output_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cv2.putText(output_frame, color_name, (x, y - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
                 detected_colors.add(color_name)
 
-    # Publish detected colors
     if publisher and detected_colors:
         for color in detected_colors:
-            msg = String()
-            msg.data = color
-            publisher.publish(msg)
+            publisher.publish(String(data=color))
             rospy.loginfo(f"Published detected color: {color}")
 
     return output_frame
@@ -64,20 +72,21 @@ def main():
     rospy.init_node("color_detector_node")
     color_pub = rospy.Publisher("/detected_color", String, queue_size=10)
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture("/dev/video0")
     if not cap.isOpened():
         print("Error: Cannot open camera.")
         return
 
-    color_ranges, saved_color_space = load_calibration_data()
+    wait_for_tracker_ready()
 
+    color_ranges, saved_color_space = load_calibration_data()
     use_saved = False
+
     if color_ranges:
         user_input = input("Calibration found. Use saved data? (y/n): ").strip().lower()
         if user_input == 'y':
             use_saved = True
             range_filter = saved_color_space
-            print(f"Using saved calibration in {range_filter} space.")
         else:
             range_filter = input("Choose color space (HSV/BGR): ").strip().upper()
     else:
@@ -89,35 +98,32 @@ def main():
 
     if not use_saved:
         color_ranges = {}
-        for color in ['red', 'green', 'blue', 'yellow']:  # <-- Added yellow here
+        for color in ['red', 'green', 'blue', 'yellow']:
             print(f"Calibrating {color}...")
             _ = cap.read()
-            track_vals = rf.process_live_feed(cap, preview=True, imut=False, frame_width=640) 
-            lower_vals, upper_vals = track_vals[:3], track_vals[3:]
-            lower = np.array(lower_vals)
-            upper = np.array(upper_vals)
-            color_ranges[color] = (lower, upper)
-            print(f"{color} calibration: lower={lower}, upper={upper}")
+            track_vals = rf.process_live_feed(cap, preview=True, imut=False, frame_width=640)
+            lower = np.array(track_vals[:3])
+            upper = np.array(track_vals[3:6])
+            brightness, saturation = track_vals[6], track_vals[7]
+            color_ranges[color] = {
+                "lower": lower,
+                "upper": upper,
+                "brightness": brightness,
+                "saturation": saturation
+            }
+        save_calibration_data(color_ranges, range_filter)
 
-        save_calibration_data(color_ranges, color_space=range_filter)
-
-    rate = rospy.Rate(10)  # 10 Hz loop
-
+    rate = rospy.Rate(10)
     while not rospy.is_shutdown():
         ret, frame = cap.read()
         if not ret:
-            print("Error: Failed to grab frame.")
             break
 
         processed_frame = process_colors(frame, color_ranges, range_filter, publisher=color_pub)
-        resized_frame = imutils.resize(processed_frame, width=720)
+        cv2.imshow("Multi-Color Detection", imutils.resize(processed_frame, width=720))
 
-        cv2.imshow("Multi-Color Detection", resized_frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
-
         rate.sleep()
 
     cap.release()
@@ -125,4 +131,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
