@@ -1,55 +1,55 @@
 #include <ros.h>
 #include <geometry_msgs/Twist.h>
-#include <Ultrasonic.h>  // Include the ultrasonic sensor library
+#include <std_msgs/Bool.h>
 
-// Motor Pins (ESP32 GPIO)
-#define LEFT_MOTOR_PWM 4
-#define RIGHT_MOTOR_PWM 16
-#define LEFT_MOTOR_IN1 12
-#define LEFT_MOTOR_IN2 13
-#define RIGHT_MOTOR_IN3 14
-#define RIGHT_MOTOR_IN4 15
+//Motor Pins (Smartcar Shield)
+#define LEFT_MOTOR_PWM 5   // ENA
+#define RIGHT_MOTOR_PWM 11 // ENB
+#define LEFT_MOTOR_IN1 7
+#define LEFT_MOTOR_IN2 6
+#define RIGHT_MOTOR_IN3 4
+#define RIGHT_MOTOR_IN4 3
 
-// Ultrasonic Sensor Pins
-#define TRIG_PIN 17
-#define ECHO_PIN 18
-Ultrasonic ultrasonic(TRIG_PIN, ECHO_PIN);
+//Ultrasonic Sensor Pins (Smartcar Shield)
+#define TRIG_PIN 13  // TRIG
+#define ECHO_PIN 12  // ECHO
 
 // ROS Node Handle
 ros::NodeHandle nh;
 
-// Define the distance threshold for obstacle detection
-#define OBSTACLE_THRESHOLD 20  // in cm
-#define BACKUP_DURATION 1000   // milliseconds
-#define TURN_DURATION 500      // milliseconds
+// Distance threshold for detecting obstacle (in cm)
+#define OBSTACLE_THRESHOLD 16
+
+// Message to publish obstacle presence
+std_msgs::Bool obstacle_msg;
+ros::Publisher obstacle_pub("in_range", &obstacle_msg);
 
 // Function to map velocity to PWM
 int velocityToPWM(float vel) {
     return constrain(abs(vel) * 255, 0, 255);
 }
 
+// Manual function to read distance from ultrasonic sensor
+long readUltrasonicDistance() {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+
+    long duration = pulseIn(ECHO_PIN, HIGH, 30000); // timeout after 30ms
+    if (duration == 0) {
+        return 999; // No valid reading
+    }
+
+    long distance = duration / 58.0; // Convert duration to cm
+    return distance;
+}
+
 // Function to handle incoming Twist messages
 void cmdVelCallback(const geometry_msgs::Twist &msg) {
-    float linear_x = msg.linear.x;  // Forward (+) / Backward (-)
-    float angular_z = msg.angular.z; // Left (+) / Right (-)
-
-    // Get the distance from the ultrasonic sensor
-    long distance = ultrasonic.read();  // Distance in cm
-    
-    // If an obstacle is too close (e.g., less than 20 cm), take evasive action
-    if (distance < OBSTACLE_THRESHOLD) {
-        // Back up for a short duration
-        moveBackwards();
-        delay(BACKUP_DURATION);
-
-        // Turn for a short duration
-        turnAround();
-        delay(TURN_DURATION);
-
-        // After evasive actions, reset to 0 speed before resuming cmd_vel
-        linear_x = 0;
-        angular_z = 0;
-    }
+    float linear_x = msg.linear.x;
+    float angular_z = msg.angular.z;
 
     // Compute motor speeds
     float left_speed = linear_x - angular_z;
@@ -80,37 +80,14 @@ void cmdVelCallback(const geometry_msgs::Twist &msg) {
     analogWrite(RIGHT_MOTOR_PWM, right_pwm);
 }
 
-// Function to move the robot backward (for obstacle avoidance)
-void moveBackwards() {
-    digitalWrite(LEFT_MOTOR_IN1, LOW);
-    digitalWrite(LEFT_MOTOR_IN2, HIGH);
-    digitalWrite(RIGHT_MOTOR_IN3, LOW);
-    digitalWrite(RIGHT_MOTOR_IN4, HIGH);
-
-    // Set speed to a moderate value for backup
-    analogWrite(LEFT_MOTOR_PWM, 200);
-    analogWrite(RIGHT_MOTOR_PWM, 200);
-}
-
-// Function to turn the robot in place (for obstacle avoidance)
-void turnAround() {
-    // Turn right for 1 second (you can adjust this for left turn if necessary)
-    digitalWrite(LEFT_MOTOR_IN1, HIGH);
-    digitalWrite(LEFT_MOTOR_IN2, LOW);
-    digitalWrite(RIGHT_MOTOR_IN3, LOW);
-    digitalWrite(RIGHT_MOTOR_IN4, HIGH);
-
-    // Set speed to a moderate value for turn
-    analogWrite(LEFT_MOTOR_PWM, 150);
-    analogWrite(RIGHT_MOTOR_PWM, 150);
-}
-
 // ROS Subscriber
 ros::Subscriber<geometry_msgs::Twist> sub("/cmd_vel", &cmdVelCallback);
 
 void setup() {
+    nh.getHardware()->setBaud(57600);
     nh.initNode();
     nh.subscribe(sub);
+    nh.advertise(obstacle_pub);
 
     // Motor pin modes
     pinMode(LEFT_MOTOR_PWM, OUTPUT);
@@ -120,14 +97,40 @@ void setup() {
     pinMode(RIGHT_MOTOR_IN3, OUTPUT);
     pinMode(RIGHT_MOTOR_IN4, OUTPUT);
 
+    // Ultrasonic sensor pin modes
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+
+    // Setup Serial Monitor
+    //Serial.begin(115200); //uncomment for base testing.
+    while (!Serial); // Wait for Serial to be ready
+
     // Stop motors initially
     digitalWrite(LEFT_MOTOR_IN1, LOW);
     digitalWrite(LEFT_MOTOR_IN2, LOW);
     digitalWrite(RIGHT_MOTOR_IN3, LOW);
     digitalWrite(RIGHT_MOTOR_IN4, LOW);
+
+    Serial.println("Tank Control with Ultrasonic Sensor Initialized.");
 }
 
 void loop() {
-    nh.spinOnce();  // Process ROS messages
-    delay(10);
+    // Read ultrasonic sensor
+    long distance = readUltrasonicDistance();
+
+    // Print distance to Serial Monitor
+    Serial.print("Distance: ");
+    Serial.print(distance);
+    Serial.println(" cm");
+
+    // Publish obstacle message
+    if (distance > 0 && distance < OBSTACLE_THRESHOLD) {
+        obstacle_msg.data = true;
+    } else {
+        obstacle_msg.data = false;
+    }
+    obstacle_pub.publish(&obstacle_msg);
+
+    nh.spinOnce();
+    delay(50);  // Small delay to avoid flooding ROS
 }
