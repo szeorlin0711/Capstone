@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import math
 import os
+import time
 import lt_rft_hsvrgb as rf
 import imutils as imut
 import rospy
@@ -12,14 +13,17 @@ from std_msgs.msg import String, Bool
 
 CALIBRATION_FILE = "calibration_data.npy"
 SYNC_FLAG_FILE = "/tmp/tracker_ready.flag"
+STOP_DURATION = 5  # seconds to wait before backup and turnaround
 
 yellow_detected = False
 current_detected_color = None
-last_tracked_color = None
+previous_detected_color = None
 color_ranges = {}
 range_filter = 'HSV'
 pub = None
 in_range = False
+stop_start_time = None
+
 
 def stop_robot():
     if pub:
@@ -27,27 +31,31 @@ def stop_robot():
         pub.publish(stop_msg)
         rospy.loginfo("Robot stopped on shutdown.")
 
+
 def color_callback(msg):
-    global yellow_detected, current_detected_color, last_tracked_color
+    global yellow_detected, current_detected_color, previous_detected_color
     color = msg.data.lower()
     if color == "yellow":
         yellow_detected = True
+        previous_detected_color = current_detected_color
         current_detected_color = None
     elif color in ['red', 'green', 'blue']:
         yellow_detected = False
         current_detected_color = color
-        last_tracked_color = color
     else:
         rospy.loginfo(f"Received unsupported color: {color}")
 
-def in_range_callback(msg):
+
+def range_callback(msg):
     global in_range
     in_range = msg.data
+
 
 def save_calibration_data(color_ranges, color_space='HSV'):
     data = {'color_space': color_space, 'ranges': color_ranges}
     np.save(CALIBRATION_FILE, data)
     print(f"Calibration data saved in {color_space} space.")
+
 
 def load_calibration_data():
     try:
@@ -55,6 +63,7 @@ def load_calibration_data():
         return data.get('ranges', {}), data.get('color_space', 'HSV')
     except FileNotFoundError:
         return None, None
+
 
 def process_frame(frame, lower, upper, range_filter='HSV'):
     if range_filter.upper() == 'HSV':
@@ -97,13 +106,14 @@ def process_frame(frame, lower, upper, range_filter='HSV'):
 
     return frame, v, w
 
+
 def main():
-    global pub, color_ranges, range_filter, current_detected_color, yellow_detected
+    global pub, color_ranges, range_filter, current_detected_color, yellow_detected, previous_detected_color, stop_start_time
 
     rospy.init_node("line_follower", anonymous=True)
-    pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+    pub = rospy.Publisher("/turtle1/cmd_vel", Twist, queue_size=10)
     rospy.Subscriber("/detected_color", String, color_callback)
-    rospy.Subscriber("/in_range", Bool, in_range_callback)
+    rospy.Subscriber("/in_range", Bool, range_callback)
     rospy.on_shutdown(stop_robot)
 
     try:
@@ -130,14 +140,14 @@ def main():
         if not color_ranges or use_saved == 'n':
             color_ranges = {}
             for color in ['red', 'blue', 'green']:
-                input(f"Press Enter to calibrate {color.upper()} color...")
+                print(f"Calibrating {color.upper()} color in 3 seconds. Please place the color in view...")
+                time.sleep(3)
                 track_vals = rf.process_live_feed(cap, preview=True, imut=False, frame_width=640)
                 lower = np.array(track_vals[:3])
                 upper = np.array(track_vals[3:])
                 color_ranges[color] = (lower, upper)
             save_calibration_data(color_ranges, range_filter)
 
-        # CREATE SYNC FLAG
         with open(SYNC_FLAG_FILE, "w") as f:
             f.write("done")
 
@@ -147,17 +157,34 @@ def main():
             if not ret:
                 break
 
-            # SAFETY PAUSE if in range
-            if in_range:
-                pub.publish(Twist())
-                cv2.imshow("Line Tracking", imut.resize(frame, width=720))
-                rate.sleep()
-                continue
+            now = time.time()
 
-            # If not in range, proceed to tracking logic
-            if yellow_detected:
-                if last_tracked_color and last_tracked_color in color_ranges:
-                    lower, upper = color_ranges[last_tracked_color]
+            if in_range:
+                if stop_start_time is None:
+                    stop_start_time = now
+                pub.publish(Twist())
+                if not yellow_detected and now - stop_start_time > STOP_DURATION:
+                    # Backup
+                    twist = Twist()
+                    twist.linear.x = -0.5
+                    pub.publish(twist)
+                    time.sleep(2)
+
+                    # Turn
+                    twist = Twist()
+                    twist.angular.z = 1
+                    pub.publish(twist)
+                    time.sleep(2)
+
+                    pub.publish(Twist())
+                    stop_start_time = None
+                    current_detected_color = previous_detected_color
+            else:
+                stop_start_time = None
+                if yellow_detected:
+                    pub.publish(Twist())
+                elif current_detected_color:
+                    lower, upper = color_ranges[current_detected_color]
                     processed_frame, v, w = process_frame(frame, lower, upper, range_filter)
                     twist = Twist()
                     twist.linear.x = v
@@ -165,18 +192,7 @@ def main():
                     pub.publish(twist)
                     cv2.imshow("Line Tracking", imut.resize(processed_frame, width=720))
                 else:
-                    pub.publish(Twist())
                     cv2.imshow("Line Tracking", imut.resize(frame, width=720))
-            elif current_detected_color and current_detected_color in color_ranges:
-                lower, upper = color_ranges[current_detected_color]
-                processed_frame, v, w = process_frame(frame, lower, upper, range_filter)
-                twist = Twist()
-                twist.linear.x = v
-                twist.angular.z = w
-                pub.publish(twist)
-                cv2.imshow("Line Tracking", imut.resize(processed_frame, width=720))
-            else:
-                cv2.imshow("Line Tracking", imut.resize(frame, width=720))
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -186,12 +202,14 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
 
+
 if __name__ == '__main__':
     main()
+
 
 @atexit.register
 def cleanup_flag():
     try:
-        os.remove(SYNC_FLAG_FILE)
+        os.remove("/tmp/tracker_ready.flag")
     except FileNotFoundError:
         pass
