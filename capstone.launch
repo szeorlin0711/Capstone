@@ -1,0 +1,7 @@
+<launch>
+	<node name="ROS_line_tracker" pkg="capstone" type="ROS_line_tracker.py" output="screen"/>
+	<node name="light_signal_sensor" pkg="capstone" type="light_signal_sensor.py" output="screen"/>
+	<node name="US_sensor_test" pkg="rosserial_python" type="serial_node.py" args="_port:=/dev/ttyUSB0"/>
+	<node name="arm_control_test" pkg="rosserial_python" type="serial_node.py" args="_port:=/dev/ttyACM0"/>
+	<node name="turtlesim" pkg="turtlesim" type="turtlesim_node" output="screen"/>
+</launch>
