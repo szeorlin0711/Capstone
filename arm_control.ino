@@ -1,38 +1,5 @@
 #include <EEPROM.h>
 #include <Servo.h>
-
-#define NUM_SERVOS 6
-#define MAX_POSES 10
-
-const int potPins[NUM_SERVOS] = {A0, A1, A2, A3, A4, A5};
-const int servoPins[NUM_SERVOS] = {2, 3, 4, 5, 6, 7};
-const int saveButtonPin = 8;
-const int playButtonPin = 9;
-
-Servo servos[NUM_SERVOS];
-int currentPose[NUM_SERVOS];
-bool isPlaying = false;
-int poseCount = 0;
-int playIndex = 0;
-unsigned long lastStepTime = 0;
-const unsigned long stepDelay = 1000;
-
-void setup() {
-  Serial.begin(9600);
-
-  // Uncomment this to clear saved poses
-  clearEEPROM();
-
-  for (int i = 0; i < NUM_SERVOS; i++) {
-    servos[i].attach(servoPins[i]);
-  }
-
-  pinMode(saveButtonPin, INPUT_PULLUP);
-  pinMode(playButtonPin, INPUT_PULLUP);
-
-  // Read saved pose count
-  poseCount = EEPROM.read(0);#include <EEPROM.h>
-#include <Servo.h>
 #include <ros.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/String.h>
@@ -52,6 +19,7 @@ int currentServoAngles[NUM_SERVOS]; // interpolated servo positions
 
 bool isPlaying = false;
 bool inRange = false;
+bool prevInRange = false; //tracks inrange state changne
 String detectedColor = "";
 
 int poseCount = 0;
@@ -96,7 +64,12 @@ void setup() {
 void loop() {
   nh.spinOnce();
 
-  if (inRange && detectedColor == "yellow") {
+
+  //Detect rising edge of inRange
+  bool playTriggered = (inRange && !prevInRange && detectedColor == "yellow");
+  prevInRange = inRange; // update previous state for next loop
+  
+  if (playTriggered) {
     if (!isPlaying) {
       isPlaying = true;
       playIndex = 0;
